@@ -61,15 +61,24 @@ def strip_credentials(therapist):
             therapist = therapist[:therapist.index(marker)].strip()
     return therapist.strip()
  
+def get_initials(first, last):
+    """Convert first and last name to initials like R.S."""
+    try:
+        f = str(first).strip()[0].upper() if str(first).strip() else ""
+        l = str(last).strip()[0].upper() if str(last).strip() else ""
+        if f and l:
+            return f"{f}.{l}."
+        return f or l
+    except:
+        return ""
+ 
 def process_schedule(df):
-    # Confirm expected columns exist
     required = ["FacilityCode","TherapistDisplayName","AppointmentStartTime2",
                 "PatientName2","CaseDescription"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         return None, f"Could not find expected columns: {missing}. Check that you uploaded the correct PT Practice Pro export."
  
-    # Filter to CTS rows only
     data = df[df["FacilityCode"].astype(str).str.strip() == "CTS"].copy()
     if data.empty:
         return None, "No patient data found. Make sure you're uploading the correct PT Practice Pro export."
@@ -88,30 +97,45 @@ def process_schedule(df):
         clean_therapist = strip_credentials(therapist)
         mins            = time_to_minutes(appt_time)
  
+        # Split clean name into first/last for initials
+        name_parts = clean_name.strip().split()
+        first_name = name_parts[0] if len(name_parts) > 0 else ""
+        last_name  = name_parts[-1] if len(name_parts) > 1 else ""
+        initials   = get_initials(first_name, last_name)
+ 
+        # Build all therapists list for this patient
         if clean_name not in patients:
             patients[clean_name] = {
                 "time": appt_time,
                 "therapist": clean_therapist,
+                "all_therapists": {clean_therapist},
                 "discipline": discipline,
-                "minutes": mins
+                "minutes": mins,
+                "initials": initials,
+                "first_name": first_name,
+                "last_name": last_name
             }
-        elif mins < patients[clean_name]["minutes"]:
-            patients[clean_name] = {
-                "time": appt_time,
-                "therapist": clean_therapist,
-                "discipline": discipline,
-                "minutes": mins
-            }
+        else:
+            # Add therapist to set
+            patients[clean_name]["all_therapists"].add(clean_therapist)
+            # Update if earlier appointment
+            if mins < patients[clean_name]["minutes"]:
+                patients[clean_name]["time"] = appt_time
+                patients[clean_name]["therapist"] = clean_therapist
+                patients[clean_name]["discipline"] = discipline
+                patients[clean_name]["minutes"] = mins
  
     if not patients:
         return None, "No valid patient records found."
  
     result = pd.DataFrame([
         {
-            "Patient Name":    name,
-            "First Appt":      d["time"],
-            "First Therapist": d["therapist"],
-            "Discipline":      d["discipline"],
+            "Patient Name":      name,
+            "Initials":          d["initials"],
+            "First Appt":        d["time"],
+            "First Therapist":   d["therapist"],
+            "All Therapists":    ", ".join(sorted(d["all_therapists"])),
+            "Discipline":        d["discipline"],
         }
         for name, d in patients.items()
     ])
@@ -120,6 +144,29 @@ def process_schedule(df):
     result = result.sort_values("_min").drop(columns=["_min"]).reset_index(drop=True)
     result.index = result.index + 1
     return result, None
+ 
+def save_to_dropbox(df):
+    """Save the schedule DataFrame to Dropbox as Excel."""
+    try:
+        import dropbox
+        token = st.secrets["DROPBOX_TOKEN"]
+        dbx = dropbox.Dropbox(token)
+ 
+        # Convert to Excel in memory
+        output = io.BytesIO()
+        with pd.ExcelWriter(output, engine="openpyxl") as writer:
+            df.to_excel(writer, index=True, sheet_name="Schedule")
+        output.seek(0)
+ 
+        # Upload to Dropbox app folder
+        dbx.files_upload(
+            output.read(),
+            "/daily_schedule.xlsx",
+            mode=dropbox.files.WriteMode.overwrite
+        )
+        return True, None
+    except Exception as e:
+        return False, str(e)
  
 DISC_COLORS = {
     "Physical Therapy":    "#d0e8ff",
@@ -163,11 +210,19 @@ if uploaded_file:
         st.error(f"⚠️ {error}")
         st.write("**Column names found in your file:**", list(df.columns))
     else:
+        # Save to Dropbox automatically
+        with st.spinner("Saving schedule to Dropbox..."):
+            success, err = save_to_dropbox(result_df)
+            if success:
+                st.success("✅ Schedule saved to Dropbox — Zapier is ready to route check-ins!")
+            else:
+                st.warning(f"⚠️ Could not save to Dropbox: {err}")
+ 
         # Metrics
-        total      = len(result_df)
-        pt_count   = result_df["Discipline"].str.contains("Physical",      na=False).sum()
-        ot_count   = result_df["Discipline"].str.contains("Occupational",  na=False).sum()
-        st_count   = result_df["Discipline"].str.contains("Speech",        na=False).sum()
+        total        = len(result_df)
+        pt_count     = result_df["Discipline"].str.contains("Physical",     na=False).sum()
+        ot_count     = result_df["Discipline"].str.contains("Occupational", na=False).sum()
+        st_count     = result_df["Discipline"].str.contains("Speech",       na=False).sum()
         n_therapists = result_df["First Therapist"].nunique()
  
         c1, c2, c3, c4, c5 = st.columns(5)
@@ -179,7 +234,6 @@ if uploaded_file:
  
         st.markdown("---")
  
-        # Legend
         st.markdown("""
         <div style='display:flex;gap:20px;margin-bottom:10px;font-size:13px;'>
             <span style='background:#d0e8ff;padding:3px 12px;border-radius:4px;'>■ Physical Therapy</span>
@@ -188,7 +242,6 @@ if uploaded_file:
         </div>
         """, unsafe_allow_html=True)
  
-        # Therapist filter
         options = ["All Therapists"] + sorted(result_df["First Therapist"].unique().tolist())
         selected = st.selectbox("Filter by therapist:", options)
         display_df = result_df if selected == "All Therapists" else \
@@ -209,8 +262,6 @@ if uploaded_file:
             mime="text/csv"
         )
  
-        st.info("💡 **Next step:** This lookup table is what Zapier will read to route "
-                "check-in notifications to the correct therapist via RingCentral.")
 else:
     st.markdown("""
     <div style='background:white;padding:30px;border-radius:12px;
@@ -219,10 +270,10 @@ else:
         <ol style='text-align:left;display:inline-block;'>
             <li>Open PT Practice Pro and export your <b>daily patient list</b> as CSV</li>
             <li>Click <b>Browse files</b> above (or drag and drop the CSV)</li>
-            <li>Your clean check-in schedule appears instantly</li>
+            <li>Schedule saves to Dropbox automatically</li>
             <li>Re-upload anytime the schedule changes throughout the day</li>
         </ol>
-        <p style='margin-top:20px;color:#888;'>No data is stored — everything stays on your computer.</p>
+        <p style='margin-top:20px;color:#888;'>No data is stored beyond your secure Dropbox folder.</p>
     </div>
     """, unsafe_allow_html=True)
  
