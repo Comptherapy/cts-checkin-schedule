@@ -2,13 +2,13 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime
 import io
- 
+
 st.set_page_config(
     page_title="Clinic Check-In Schedule",
     page_icon="🏥",
     layout="wide"
 )
- 
+
 st.markdown("""
 <style>
     .main { background-color: #f0f4f8; }
@@ -23,8 +23,7 @@ st.markdown("""
     div[data-testid="metric-container"] div { color: white !important; }
 </style>
 """, unsafe_allow_html=True)
- 
-# ── Helpers ────────────────────────────────────────────────────────────────────
+
 def time_to_minutes(t):
     if pd.isna(t):
         return 9999
@@ -36,7 +35,7 @@ def time_to_minutes(t):
         except:
             continue
     return 9999
- 
+
 def strip_status(name):
     if pd.isna(name):
         return ""
@@ -49,7 +48,7 @@ def strip_status(name):
         if parts[1].strip() in ["Open","Arrived","Cancelled","No Show","Rescheduled"]:
             return parts[0].strip()
     return name
- 
+
 def strip_credentials(therapist):
     if pd.isna(therapist):
         return ""
@@ -60,50 +59,42 @@ def strip_credentials(therapist):
         if marker in therapist:
             therapist = therapist[:therapist.index(marker)].strip()
     return therapist.strip()
- 
-def get_initials(first, last):
-    """Convert first and last name to initials like R.S."""
+
+def get_initials(name):
     try:
-        f = str(first).strip()[0].upper() if str(first).strip() else ""
-        l = str(last).strip()[0].upper() if str(last).strip() else ""
-        if f and l:
-            return f"{f}.{l}."
-        return f or l
+        parts = name.strip().split()
+        first = parts[0][0].upper() if parts else ""
+        last  = parts[-1][0].upper() if len(parts) > 1 else ""
+        return f"{first}.{last}." if first and last else first or last
     except:
         return ""
- 
+
 def process_schedule(df):
     required = ["FacilityCode","TherapistDisplayName","AppointmentStartTime2",
                 "PatientName2","CaseDescription"]
     missing = [c for c in required if c not in df.columns]
     if missing:
-        return None, f"Could not find expected columns: {missing}. Check that you uploaded the correct PT Practice Pro export."
- 
+        return None, f"Could not find expected columns: {missing}."
+
     data = df[df["FacilityCode"].astype(str).str.strip() == "CTS"].copy()
     if data.empty:
-        return None, "No patient data found. Make sure you're uploading the correct PT Practice Pro export."
- 
+        return None, "No patient data found."
+
     patients = {}
     for _, row in data.iterrows():
         therapist  = str(row["TherapistDisplayName"])
         appt_time  = str(row["AppointmentStartTime2"]).strip()
         pat_name   = str(row["PatientName2"])
         discipline = str(row["CaseDescription"]).strip()
- 
+
         if not pat_name or pat_name == "nan":
             continue
- 
+
         clean_name      = strip_status(pat_name)
         clean_therapist = strip_credentials(therapist)
         mins            = time_to_minutes(appt_time)
- 
-        # Split clean name into first/last for initials
-        name_parts = clean_name.strip().split()
-        first_name = name_parts[0] if len(name_parts) > 0 else ""
-        last_name  = name_parts[-1] if len(name_parts) > 1 else ""
-        initials   = get_initials(first_name, last_name)
- 
-        # Build all therapists list for this patient
+        initials        = get_initials(clean_name)
+
         if clean_name not in patients:
             patients[clean_name] = {
                 "time": appt_time,
@@ -112,86 +103,79 @@ def process_schedule(df):
                 "discipline": discipline,
                 "minutes": mins,
                 "initials": initials,
-                "first_name": first_name,
-                "last_name": last_name
             }
         else:
-            # Add therapist to set
             patients[clean_name]["all_therapists"].add(clean_therapist)
-            # Update if earlier appointment
             if mins < patients[clean_name]["minutes"]:
-                patients[clean_name]["time"] = appt_time
-                patients[clean_name]["therapist"] = clean_therapist
-                patients[clean_name]["discipline"] = discipline
-                patients[clean_name]["minutes"] = mins
- 
+                patients[clean_name].update({
+                    "time": appt_time,
+                    "therapist": clean_therapist,
+                    "discipline": discipline,
+                    "minutes": mins,
+                })
+
     if not patients:
         return None, "No valid patient records found."
- 
+
     result = pd.DataFrame([
         {
-            "Patient Name":      name,
-            "Initials":          d["initials"],
-            "First Appt":        d["time"],
-            "First Therapist":   d["therapist"],
-            "All Therapists":    ", ".join(sorted(d["all_therapists"])),
-            "Discipline":        d["discipline"],
+            "Patient Name":    name,
+            "Initials":        d["initials"],
+            "First Appt":      d["time"],
+            "First Therapist": d["therapist"],
+            "All Therapists":  ", ".join(sorted(d["all_therapists"])),
+            "Discipline":      d["discipline"],
         }
         for name, d in patients.items()
     ])
- 
+
     result["_min"] = result["First Appt"].apply(time_to_minutes)
     result = result.sort_values("_min").drop(columns=["_min"]).reset_index(drop=True)
     result.index = result.index + 1
     return result, None
- 
+
 def save_to_dropbox(df):
-    """Save the schedule DataFrame to Dropbox as Excel."""
+    """Save the schedule DataFrame to Dropbox as CSV."""
     try:
         import dropbox
         token = st.secrets["DROPBOX_TOKEN"]
         dbx = dropbox.Dropbox(token)
- 
-        # Convert to Excel in memory
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine="openpyxl") as writer:
-            df.to_excel(writer, index=True, sheet_name="Schedule")
-        output.seek(0)
- 
-        # Upload to Dropbox app folder
+
+        csv_bytes = df.to_csv(index=True).encode("utf-8")
+
         dbx.files_upload(
-            output.read(),
-            "/daily_schedule.xlsx",
+            csv_bytes,
+            "/daily_schedule.csv",
             mode=dropbox.files.WriteMode.overwrite
         )
         return True, None
     except Exception as e:
         return False, str(e)
- 
+
 DISC_COLORS = {
     "Physical Therapy":    "#d0e8ff",
     "Occupational Therapy":"#d4f0d4",
     "Speech Therapy":      "#fff3cd",
 }
- 
+
 def color_row(row):
     disc = str(row.get("Discipline", ""))
     for key, color in DISC_COLORS.items():
         if key in disc:
             return [f"background-color: {color}"] * len(row)
     return [""] * len(row)
- 
+
 # ── UI ─────────────────────────────────────────────────────────────────────────
 st.title("🏥 Daily Check-In Schedule")
 st.markdown("Upload your PT Practice Pro daily export to generate today's check-in lookup.")
 st.markdown("---")
- 
+
 uploaded_file = st.file_uploader(
     "Drop your PT Practice Pro CSV export here",
     type=["csv", "txt"],
     help="Export your daily patient list from PT Practice Pro as CSV, then upload it here."
 )
- 
+
 if uploaded_file:
     try:
         df = pd.read_csv(
@@ -203,37 +187,34 @@ if uploaded_file:
     except Exception as e:
         st.error(f"Could not read file: {e}")
         st.stop()
- 
+
     result_df, error = process_schedule(df)
- 
+
     if error:
         st.error(f"⚠️ {error}")
         st.write("**Column names found in your file:**", list(df.columns))
     else:
-        # Save to Dropbox automatically
         with st.spinner("Saving schedule to Dropbox..."):
             success, err = save_to_dropbox(result_df)
             if success:
                 st.success("✅ Schedule saved to Dropbox — Zapier is ready to route check-ins!")
             else:
                 st.warning(f"⚠️ Could not save to Dropbox: {err}")
- 
-        # Metrics
+
         total        = len(result_df)
         pt_count     = result_df["Discipline"].str.contains("Physical",     na=False).sum()
         ot_count     = result_df["Discipline"].str.contains("Occupational", na=False).sum()
         st_count     = result_df["Discipline"].str.contains("Speech",       na=False).sum()
         n_therapists = result_df["First Therapist"].nunique()
- 
+
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Total Patients",       total)
         c2.metric("Physical Therapy",     pt_count)
         c3.metric("Occupational Therapy", ot_count)
         c4.metric("Speech Therapy",       st_count)
         c5.metric("Therapists Today",     n_therapists)
- 
+
         st.markdown("---")
- 
         st.markdown("""
         <div style='display:flex;gap:20px;margin-bottom:10px;font-size:13px;'>
             <span style='background:#d0e8ff;padding:3px 12px;border-radius:4px;'>■ Physical Therapy</span>
@@ -241,19 +222,19 @@ if uploaded_file:
             <span style='background:#fff3cd;padding:3px 12px;border-radius:4px;'>■ Speech Therapy</span>
         </div>
         """, unsafe_allow_html=True)
- 
+
         options = ["All Therapists"] + sorted(result_df["First Therapist"].unique().tolist())
         selected = st.selectbox("Filter by therapist:", options)
         display_df = result_df if selected == "All Therapists" else \
                      result_df[result_df["First Therapist"] == selected]
- 
+
         st.dataframe(
             display_df.style.apply(color_row, axis=1),
             use_container_width=True,
             height=min(600, 50 + len(display_df) * 38),
         )
         st.markdown(f"*Showing {len(display_df)} of {total} patients — sorted by first appointment time*")
- 
+
         st.markdown("---")
         st.download_button(
             label="⬇️ Download Lookup as CSV",
@@ -261,7 +242,7 @@ if uploaded_file:
             file_name="checkin_lookup.csv",
             mime="text/csv"
         )
- 
+
 else:
     st.markdown("""
     <div style='background:white;padding:30px;border-radius:12px;
@@ -276,6 +257,6 @@ else:
         <p style='margin-top:20px;color:#888;'>No data is stored beyond your secure Dropbox folder.</p>
     </div>
     """, unsafe_allow_html=True)
- 
+
 st.markdown("---")
 st.caption("Clinic Check-In Schedule Tool • Built for CTS Pediatric Therapy")
