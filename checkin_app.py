@@ -167,7 +167,7 @@ def save_to_dropbox(zapier_df):
 
         dbx.files_upload(
             csv_bytes,
-            "/Apps/CTS Schedule Sync/daily_schedule.csv",
+            "/Apps/CTS Schedule Sync/Apps/CTS Schedule Sync/daily_schedule.csv",
             mode=dropbox.files.WriteMode.overwrite
         )
         return True, None
