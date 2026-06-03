@@ -148,7 +148,7 @@ def save_to_dropbox(df):
 
         dbx.files_upload(
             csv_bytes,
-            "/daily_schedule.csv",
+            "/Apps/CTS Schedule Sync/daily_schedule.csv",
             mode=dropbox.files.WriteMode.overwrite
         )
         return True, None
