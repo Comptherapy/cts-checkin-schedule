@@ -138,8 +138,11 @@ def save_to_dropbox(df):
     """Save the schedule DataFrame to Dropbox as CSV."""
     try:
         import dropbox
-        token = st.secrets["DROPBOX_TOKEN"]
-        dbx = dropbox.Dropbox(token)
+        dbx = dropbox.Dropbox(
+            oauth2_refresh_token=st.secrets["DROPBOX_REFRESH_TOKEN"],
+            app_key=st.secrets["DROPBOX_APP_KEY"],
+            app_secret=st.secrets["DROPBOX_APP_SECRET"]
+        )
 
         csv_bytes = df.to_csv(index=True).encode("utf-8")
 
