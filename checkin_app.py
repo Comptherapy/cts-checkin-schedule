@@ -74,13 +74,14 @@ def process_schedule(df):
                 "PatientName2","CaseDescription"]
     missing = [c for c in required if c not in df.columns]
     if missing:
-        return None, f"Could not find expected columns: {missing}."
+        return None, None, f"Could not find expected columns: {missing}."
 
     data = df[df["FacilityCode"].astype(str).str.strip() == "CTS"].copy()
     if data.empty:
-        return None, "No patient data found."
+        return None, None, "No patient data found."
 
-    patients = {}
+    # ── Build Zapier CSV (one row per therapist per patient) ──────────────────
+    zapier_rows = []
     for _, row in data.iterrows():
         therapist  = str(row["TherapistDisplayName"])
         appt_time  = str(row["AppointmentStartTime2"]).strip()
@@ -92,32 +93,48 @@ def process_schedule(df):
 
         clean_name      = strip_status(pat_name)
         clean_therapist = strip_credentials(therapist)
-        mins            = time_to_minutes(appt_time)
         initials        = get_initials(clean_name)
 
-        if clean_name not in patients:
-            patients[clean_name] = {
-                "time": appt_time,
-                "therapist": clean_therapist,
-                "all_therapists": {clean_therapist},
-                "discipline": discipline,
-                "minutes": mins,
-                "initials": initials,
+        zapier_rows.append({
+            "Patient Name": clean_name,
+            "Initials":     initials,
+            "Appt Time":    appt_time,
+            "Therapist":    clean_therapist,
+            "Discipline":   discipline,
+        })
+
+    if not zapier_rows:
+        return None, None, "No valid patient records found."
+
+    zapier_df = pd.DataFrame(zapier_rows)
+    zapier_df["_min"] = zapier_df["Appt Time"].apply(time_to_minutes)
+    zapier_df = zapier_df.sort_values(["Patient Name", "_min"]).drop(columns=["_min"]).reset_index(drop=True)
+
+    # ── Build display table (collapsed, one row per patient) ──────────────────
+    patients = {}
+    for r in zapier_rows:
+        name = r["Patient Name"]
+        mins = time_to_minutes(r["Appt Time"])
+        if name not in patients:
+            patients[name] = {
+                "time":          r["Appt Time"],
+                "therapist":     r["Therapist"],
+                "all_therapists": {r["Therapist"]},
+                "discipline":    r["Discipline"],
+                "minutes":       mins,
+                "initials":      r["Initials"],
             }
         else:
-            patients[clean_name]["all_therapists"].add(clean_therapist)
-            if mins < patients[clean_name]["minutes"]:
-                patients[clean_name].update({
-                    "time": appt_time,
-                    "therapist": clean_therapist,
-                    "discipline": discipline,
-                    "minutes": mins,
+            patients[name]["all_therapists"].add(r["Therapist"])
+            if mins < patients[name]["minutes"]:
+                patients[name].update({
+                    "time":       r["Appt Time"],
+                    "therapist":  r["Therapist"],
+                    "discipline": r["Discipline"],
+                    "minutes":    mins,
                 })
 
-    if not patients:
-        return None, "No valid patient records found."
-
-    result = pd.DataFrame([
+    display_df = pd.DataFrame([
         {
             "Patient Name":    name,
             "Initials":        d["initials"],
@@ -129,13 +146,15 @@ def process_schedule(df):
         for name, d in patients.items()
     ])
 
-    result["_min"] = result["First Appt"].apply(time_to_minutes)
-    result = result.sort_values("_min").drop(columns=["_min"]).reset_index(drop=True)
-    result.index = result.index + 1
-    return result, None
+    display_df["_min"] = display_df["First Appt"].apply(time_to_minutes)
+    display_df = display_df.sort_values("_min").drop(columns=["_min"]).reset_index(drop=True)
+    display_df.index = display_df.index + 1
 
-def save_to_dropbox(df):
-    """Save the schedule DataFrame to Dropbox as CSV."""
+    return display_df, zapier_df, None
+
+
+def save_to_dropbox(zapier_df):
+    """Save the per-therapist schedule to Dropbox for Zapier lookup."""
     try:
         import dropbox
         dbx = dropbox.Dropbox(
@@ -144,11 +163,11 @@ def save_to_dropbox(df):
             app_secret=st.secrets["DROPBOX_APP_SECRET"]
         )
 
-        csv_bytes = df.to_csv(index=True).encode("utf-8")
+        csv_bytes = zapier_df.to_csv(index=False).encode("utf-8")
 
         dbx.files_upload(
             csv_bytes,
-            "/daily_schedule.csv",
+            "/Apps/CTS Schedule Sync/daily_schedule.csv",
             mode=dropbox.files.WriteMode.overwrite
         )
         return True, None
@@ -191,14 +210,14 @@ if uploaded_file:
         st.error(f"Could not read file: {e}")
         st.stop()
 
-    result_df, error = process_schedule(df)
+    result_df, zapier_df, error = process_schedule(df)
 
     if error:
         st.error(f"⚠️ {error}")
         st.write("**Column names found in your file:**", list(df.columns))
     else:
         with st.spinner("Saving schedule to Dropbox..."):
-            success, err = save_to_dropbox(result_df)
+            success, err = save_to_dropbox(zapier_df)
             if success:
                 st.success("✅ Schedule saved to Dropbox — Zapier is ready to route check-ins!")
             else:
