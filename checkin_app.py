@@ -94,7 +94,7 @@ def load_therapist_directory():
     try:
         dbx = get_dropbox_client()
         _, res = dbx.files_download(
-            "/Apps/CTS Schedule Sync/therapist_directory.csv"
+            "/Info Info/Apps/CTS Schedule Sync/therapist_directory.csv"
         )
         dir_df = pd.read_csv(
             io.BytesIO(res.content),
