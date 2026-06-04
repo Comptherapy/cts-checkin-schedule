@@ -82,43 +82,32 @@ def build_message(initials, appt_time):
     pretty_time = format_time_ampm(appt_time)
     return f"Your {pretty_time} patient {initials} has checked-in and is waiting."
 
-def get_dropbox_client():
-    import dropbox
-    return dropbox.Dropbox(
-        oauth2_refresh_token=st.secrets["DROPBOX_REFRESH_TOKEN"],
-        app_key=st.secrets["DROPBOX_APP_KEY"],
-        app_secret=st.secrets["DROPBOX_APP_SECRET"]
-    )
-
-def load_therapist_directory():
+def load_therapist_directory(uploaded_file):
     try:
-        dbx = get_dropbox_client()
-        _, res = dbx.files_download(
-            "/Apps/CTS Schedule Sync/therapist_directory.csv"
-        )
-        dir_df = pd.read_csv(
-            io.BytesIO(res.content),
-            dtype=str
-        )
+        dir_df = pd.read_csv(uploaded_file, dtype=str)
         dir_df.columns = [c.strip() for c in dir_df.columns]
         name_col  = next(c for c in dir_df.columns if "name"  in c.lower())
         phone_col = next(c for c in dir_df.columns if "phone" in c.lower())
         return {
             str(row[name_col]).strip().lower(): str(row[phone_col]).strip()
             for _, row in dir_df.iterrows()
-            if str(row[name_col]).strip()
+            if str(row[name_col]).strip() and str(row[name_col]).strip().lower() != "nan"
         }, None
     except Exception as e:
         return {}, str(e)
 
 def save_to_dropbox(zapier_df):
     try:
-        dbx = get_dropbox_client()
         import dropbox as _dbx
+        dbx = _dbx.Dropbox(
+            oauth2_refresh_token=st.secrets["DROPBOX_REFRESH_TOKEN"],
+            app_key=st.secrets["DROPBOX_APP_KEY"],
+            app_secret=st.secrets["DROPBOX_APP_SECRET"]
+        )
         csv_bytes = zapier_df.to_csv(index=False).encode("utf-8")
         dbx.files_upload(
             csv_bytes,
-            "/Apps/CTS Schedule Sync/Apps/CTS Schedule Sync/daily_schedule.csv",
+            "/Apps/CTS Schedule Sync/daily_schedule.csv",
             mode=_dbx.files.WriteMode.overwrite
         )
         return True, None
@@ -168,7 +157,6 @@ def process_schedule(df, therapist_dir):
     patient_slots = defaultdict(list)
     for r in raw_rows:
         patient_slots[r["Patient Name"]].append(r)
-
     for name in patient_slots:
         patient_slots[name].sort(key=lambda x: x["Minutes"])
 
@@ -224,33 +212,44 @@ def color_row(row):
             return [f"background-color: {color}"] * len(row)
     return [""] * len(row)
 
+# ── UI ─────────────────────────────────────────────────────────────────────────
+
 st.title("🏥 Daily Check-In Schedule")
 st.markdown("Upload your PT Practice Pro daily export to generate today's check-in lookup.")
 st.markdown("---")
 
-uploaded_file = st.file_uploader(
-    "Drop your PT Practice Pro CSV export here",
-    type=["csv", "txt"],
-    help="Export your daily patient list from PT Practice Pro as CSV, then upload it here."
-)
+col1, col2 = st.columns(2)
 
-if uploaded_file:
+with col1:
+    schedule_file = st.file_uploader(
+        "1️⃣ Drop your PT Practice Pro schedule CSV here",
+        type=["csv", "txt"],
+        help="Export your daily patient list from PT Practice Pro as CSV."
+    )
+
+with col2:
+    directory_file = st.file_uploader(
+        "2️⃣ Drop your therapist_directory.csv here",
+        type=["csv"],
+        help="Upload the therapist directory CSV so phone numbers can be looked up."
+    )
+
+if schedule_file and directory_file:
     try:
         df = pd.read_csv(
-            uploaded_file,
+            schedule_file,
             encoding="utf-8-sig",
             dtype=str,
             on_bad_lines="skip"
         )
     except Exception as e:
-        st.error(f"Could not read file: {e}")
+        st.error(f"Could not read schedule file: {e}")
         st.stop()
 
-    with st.spinner("Loading therapist directory from Dropbox..."):
-        therapist_dir, dir_err = load_therapist_directory()
+    therapist_dir, dir_err = load_therapist_directory(directory_file)
 
     if dir_err:
-        st.warning(f"⚠️ Could not load therapist directory: {dir_err}  \nPhone numbers will be blank — SMS routing may fail.")
+        st.warning(f"⚠️ Could not load therapist directory: {dir_err}")
     else:
         st.success(f"✅ Therapist directory loaded ({len(therapist_dir)} therapists)")
 
@@ -317,14 +316,17 @@ if uploaded_file:
             mime="text/csv"
         )
 
+elif schedule_file and not directory_file:
+    st.info("👆 Now drop your therapist_directory.csv in box 2 to complete the upload.")
+
 else:
     st.markdown("""
     <div style='background:white;padding:30px;border-radius:12px;
                 border:2px dashed #2F5496;text-align:center;color:#555;'>
         <h3 style='color:#2F5496;'>How to use this app</h3>
         <ol style='text-align:left;display:inline-block;'>
-            <li>Open PT Practice Pro and export your <b>daily patient list</b> as CSV</li>
-            <li>Click <b>Browse files</b> above (or drag and drop the CSV)</li>
+            <li>Drop your <b>PT Practice Pro schedule CSV</b> in box 1</li>
+            <li>Drop your <b>therapist_directory.csv</b> in box 2</li>
             <li>Schedule saves to Dropbox automatically — Zapier reads it directly</li>
             <li>Re-upload anytime the schedule changes throughout the day</li>
         </ol>
