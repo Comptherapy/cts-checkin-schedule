@@ -45,7 +45,7 @@ def strip_status(name):
             return name[:-len(s)].strip()
     if "-" in name:
         parts = name.rsplit("-", 1)
-        if parts[1].strip() in ["Open","Arrived","Cancelled","No Show","Rescheduled"]:
+        if parts[1].strip() in ["Open", "Arrived", "Cancelled", "No Show", "Rescheduled"]:
             return parts[0].strip()
     return name
 
@@ -69,9 +69,65 @@ def get_initials(name):
     except:
         return ""
 
-def process_schedule(df):
-    required = ["FacilityCode","TherapistDisplayName","AppointmentStartTime2",
-                "PatientName2","CaseDescription"]
+def format_time_ampm(t):
+    t = str(t).strip()
+    for fmt in ["%I:%M %p", "%H:%M", "%I:%M%p"]:
+        try:
+            return datetime.strptime(t, fmt).strftime("%-I:%M %p")
+        except:
+            continue
+    return t
+
+def build_message(initials, appt_time):
+    pretty_time = format_time_ampm(appt_time)
+    return f"Your {pretty_time} patient {initials} has checked-in and is waiting."
+
+def get_dropbox_client():
+    import dropbox
+    return dropbox.Dropbox(
+        oauth2_refresh_token=st.secrets["DROPBOX_REFRESH_TOKEN"],
+        app_key=st.secrets["DROPBOX_APP_KEY"],
+        app_secret=st.secrets["DROPBOX_APP_SECRET"]
+    )
+
+def load_therapist_directory():
+    try:
+        dbx = get_dropbox_client()
+        _, res = dbx.files_download(
+            "/Apps/CTS Schedule Sync/therapist_directory.csv"
+        )
+        dir_df = pd.read_csv(
+            io.BytesIO(res.content),
+            dtype=str
+        )
+        dir_df.columns = [c.strip() for c in dir_df.columns]
+        name_col  = next(c for c in dir_df.columns if "name"  in c.lower())
+        phone_col = next(c for c in dir_df.columns if "phone" in c.lower())
+        return {
+            str(row[name_col]).strip().lower(): str(row[phone_col]).strip()
+            for _, row in dir_df.iterrows()
+            if str(row[name_col]).strip()
+        }, None
+    except Exception as e:
+        return {}, str(e)
+
+def save_to_dropbox(zapier_df):
+    try:
+        dbx = get_dropbox_client()
+        import dropbox as _dbx
+        csv_bytes = zapier_df.to_csv(index=False).encode("utf-8")
+        dbx.files_upload(
+            csv_bytes,
+            "/Apps/CTS Schedule Sync/Apps/CTS Schedule Sync/daily_schedule.csv",
+            mode=_dbx.files.WriteMode.overwrite
+        )
+        return True, None
+    except Exception as e:
+        return False, str(e)
+
+def process_schedule(df, therapist_dir):
+    required = ["FacilityCode", "TherapistDisplayName", "AppointmentStartTime2",
+                "PatientName2", "CaseDescription"]
     missing = [c for c in required if c not in df.columns]
     if missing:
         return None, None, f"Could not find expected columns: {missing}."
@@ -80,8 +136,7 @@ def process_schedule(df):
     if data.empty:
         return None, None, "No patient data found."
 
-    # ── Build Zapier CSV (one row per therapist per patient) ──────────────────
-    zapier_rows = []
+    raw_rows = []
     for _, row in data.iterrows():
         therapist  = str(row["TherapistDisplayName"])
         appt_time  = str(row["AppointmentStartTime2"]).strip()
@@ -94,90 +149,72 @@ def process_schedule(df):
         clean_name      = strip_status(pat_name)
         clean_therapist = strip_credentials(therapist)
         initials        = get_initials(clean_name)
+        phone           = therapist_dir.get(clean_therapist.lower(), "")
 
-        zapier_rows.append({
+        raw_rows.append({
             "Patient Name": clean_name,
             "Initials":     initials,
             "Appt Time":    appt_time,
+            "Minutes":      time_to_minutes(appt_time),
             "Therapist":    clean_therapist,
             "Discipline":   discipline,
+            "Phone":        phone,
         })
 
-    if not zapier_rows:
+    if not raw_rows:
         return None, None, "No valid patient records found."
 
-    zapier_df = pd.DataFrame(zapier_rows)
-    zapier_df["_min"] = zapier_df["Appt Time"].apply(time_to_minutes)
-    zapier_df = zapier_df.sort_values(["Patient Name", "_min"]).drop(columns=["_min"]).reset_index(drop=True)
+    from collections import defaultdict
+    patient_slots = defaultdict(list)
+    for r in raw_rows:
+        patient_slots[r["Patient Name"]].append(r)
 
-    # ── Build display table (collapsed, one row per patient) ──────────────────
-    patients = {}
-    for r in zapier_rows:
-        name = r["Patient Name"]
-        mins = time_to_minutes(r["Appt Time"])
-        if name not in patients:
-            patients[name] = {
-                "time":          r["Appt Time"],
-                "therapist":     r["Therapist"],
-                "all_therapists": {r["Therapist"]},
-                "discipline":    r["Discipline"],
-                "minutes":       mins,
-                "initials":      r["Initials"],
-            }
-        else:
-            patients[name]["all_therapists"].add(r["Therapist"])
-            if mins < patients[name]["minutes"]:
-                patients[name].update({
-                    "time":       r["Appt Time"],
-                    "therapist":  r["Therapist"],
-                    "discipline": r["Discipline"],
-                    "minutes":    mins,
-                })
+    for name in patient_slots:
+        patient_slots[name].sort(key=lambda x: x["Minutes"])
 
-    display_df = pd.DataFrame([
-        {
+    zapier_rows = []
+    for name, slots in patient_slots.items():
+        initials = slots[0]["Initials"]
+        row = {"Patient Name": name, "Initials": initials}
+        for i, slot in enumerate(slots[:3], start=1):
+            msg = build_message(initials, slot["Appt Time"])
+            row[f"Therapist{i}"] = slot["Therapist"]
+            row[f"Time{i}"]      = slot["Appt Time"]
+            row[f"Phone{i}"]     = slot["Phone"]
+            row[f"Message{i}"]   = msg
+        zapier_rows.append(row)
+
+    all_cols = ["Patient Name", "Initials"]
+    for i in range(1, 4):
+        all_cols += [f"Therapist{i}", f"Time{i}", f"Phone{i}", f"Message{i}"]
+
+    zapier_df = pd.DataFrame(zapier_rows, columns=all_cols).fillna("")
+    zapier_df["_min"] = zapier_df["Time1"].apply(time_to_minutes)
+    zapier_df = zapier_df.sort_values("_min").drop(columns=["_min"]).reset_index(drop=True)
+
+    display_rows = []
+    for name, slots in patient_slots.items():
+        all_therapists = ", ".join(s["Therapist"] for s in slots)
+        display_rows.append({
             "Patient Name":    name,
-            "Initials":        d["initials"],
-            "First Appt":      d["time"],
-            "First Therapist": d["therapist"],
-            "All Therapists":  ", ".join(sorted(d["all_therapists"])),
-            "Discipline":      d["discipline"],
-        }
-        for name, d in patients.items()
-    ])
+            "Initials":        slots[0]["Initials"],
+            "First Appt":      slots[0]["Appt Time"],
+            "First Therapist": slots[0]["Therapist"],
+            "All Therapists":  all_therapists,
+            "Discipline":      slots[0]["Discipline"],
+        })
 
+    display_df = pd.DataFrame(display_rows)
     display_df["_min"] = display_df["First Appt"].apply(time_to_minutes)
     display_df = display_df.sort_values("_min").drop(columns=["_min"]).reset_index(drop=True)
     display_df.index = display_df.index + 1
 
     return display_df, zapier_df, None
 
-
-def save_to_dropbox(zapier_df):
-    """Save the per-therapist schedule to Dropbox for Zapier lookup."""
-    try:
-        import dropbox
-        dbx = dropbox.Dropbox(
-            oauth2_refresh_token=st.secrets["DROPBOX_REFRESH_TOKEN"],
-            app_key=st.secrets["DROPBOX_APP_KEY"],
-            app_secret=st.secrets["DROPBOX_APP_SECRET"]
-        )
-
-        csv_bytes = zapier_df.to_csv(index=False).encode("utf-8")
-
-        dbx.files_upload(
-            csv_bytes,
-            "/Apps/CTS Schedule Sync/Apps/CTS Schedule Sync/daily_schedule.csv",
-            mode=dropbox.files.WriteMode.overwrite
-        )
-        return True, None
-    except Exception as e:
-        return False, str(e)
-
 DISC_COLORS = {
-    "Physical Therapy":    "#d0e8ff",
-    "Occupational Therapy":"#d4f0d4",
-    "Speech Therapy":      "#fff3cd",
+    "Physical Therapy":     "#d0e8ff",
+    "Occupational Therapy": "#d4f0d4",
+    "Speech Therapy":       "#fff3cd",
 }
 
 def color_row(row):
@@ -187,7 +224,6 @@ def color_row(row):
             return [f"background-color: {color}"] * len(row)
     return [""] * len(row)
 
-# ── UI ─────────────────────────────────────────────────────────────────────────
 st.title("🏥 Daily Check-In Schedule")
 st.markdown("Upload your PT Practice Pro daily export to generate today's check-in lookup.")
 st.markdown("---")
@@ -210,7 +246,15 @@ if uploaded_file:
         st.error(f"Could not read file: {e}")
         st.stop()
 
-    result_df, zapier_df, error = process_schedule(df)
+    with st.spinner("Loading therapist directory from Dropbox..."):
+        therapist_dir, dir_err = load_therapist_directory()
+
+    if dir_err:
+        st.warning(f"⚠️ Could not load therapist directory: {dir_err}  \nPhone numbers will be blank — SMS routing may fail.")
+    else:
+        st.success(f"✅ Therapist directory loaded ({len(therapist_dir)} therapists)")
+
+    result_df, zapier_df, error = process_schedule(df, therapist_dir)
 
     if error:
         st.error(f"⚠️ {error}")
@@ -245,17 +289,25 @@ if uploaded_file:
         </div>
         """, unsafe_allow_html=True)
 
-        options = ["All Therapists"] + sorted(result_df["First Therapist"].unique().tolist())
+        options  = ["All Therapists"] + sorted(result_df["First Therapist"].unique().tolist())
         selected = st.selectbox("Filter by therapist:", options)
-        display_df = result_df if selected == "All Therapists" else \
-                     result_df[result_df["First Therapist"] == selected]
+        disp     = result_df if selected == "All Therapists" else \
+                   result_df[result_df["First Therapist"] == selected]
 
         st.dataframe(
-            display_df.style.apply(color_row, axis=1),
+            disp.style.apply(color_row, axis=1),
             use_container_width=True,
-            height=min(600, 50 + len(display_df) * 38),
+            height=min(600, 50 + len(disp) * 38),
         )
-        st.markdown(f"*Showing {len(display_df)} of {total} patients — sorted by first appointment time*")
+        st.markdown(f"*Showing {len(disp)} of {total} patients — sorted by first appointment time*")
+
+        with st.expander("🔍 Preview Zapier SMS output"):
+            preview_cols = [c for c in zapier_df.columns
+                            if c in ["Patient Name", "Initials",
+                                     "Therapist1", "Time1", "Phone1", "Message1",
+                                     "Therapist2", "Time2", "Phone2", "Message2",
+                                     "Therapist3", "Time3", "Phone3", "Message3"]]
+            st.dataframe(zapier_df[preview_cols], use_container_width=True)
 
         st.markdown("---")
         st.download_button(
@@ -273,7 +325,7 @@ else:
         <ol style='text-align:left;display:inline-block;'>
             <li>Open PT Practice Pro and export your <b>daily patient list</b> as CSV</li>
             <li>Click <b>Browse files</b> above (or drag and drop the CSV)</li>
-            <li>Schedule saves to Dropbox automatically</li>
+            <li>Schedule saves to Dropbox automatically — Zapier reads it directly</li>
             <li>Re-upload anytime the schedule changes throughout the day</li>
         </ol>
         <p style='margin-top:20px;color:#888;'>No data is stored beyond your secure Dropbox folder.</p>
